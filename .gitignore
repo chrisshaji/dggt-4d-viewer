@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Model checkpoints
+*.pth
+*.ckpt
+
+# Large scene / tensor exports
+*.pt
+*.npz
+*.npy
+
+# Videos and generated media
+*.mp4
+*.mov
+*.avi
+*.webm
+
+# Generated outputs
+outputs/
+output/
+renders/
+logs/
+work_dirs/
+
+# Local data
+data/
+datasets/
+
+# Temporary files
+*.tmp
+*.log
