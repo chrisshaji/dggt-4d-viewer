@@ -4,7 +4,7 @@ Interactive viewer for DGGT driving-scene reconstructions using `gsplat`, `viser
 
 The viewer loads a precomputed DGGT scene `.pt` file containing camera poses, static Gaussians, dynamic Gaussian states, timing information, and source-camera images. DGGT and TAPIP3D inference are performed before launching the viewer; the viewer itself only loads the exported scene and rasterizes it interactively.
 
-**Sample viewer scene (`dggt_viewer_scene_interp6.pt`):** `<ADD_DOWNLOAD_LINK>`
+**Sample viewer scene (`dggt_viewer_scene_interp6.pt`):** [Download via SwissTransfer](https://www.swisstransfer.com/dl/01a102b0-cf9e-717e-bb6a-5b7e7f496c86)
 
 ## Installation
 
