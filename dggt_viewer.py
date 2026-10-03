@@ -44,6 +44,7 @@ import torch
 
 
 def torch_load(path):
+    """Load a serialized viewer scene on CPU with PyTorch-version compatibility."""
     try:
         return torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
@@ -51,6 +52,7 @@ def torch_load(path):
 
 
 def resolve_render_size(render_arg) -> Tuple[int, int]:
+    """Resolve the active nerfview preview/final render dimensions."""
     if hasattr(render_arg, "preview_render"):
         if bool(render_arg.preview_render):
             return int(render_arg.render_width), int(render_arg.render_height)
@@ -92,6 +94,7 @@ class DGGT4DViewer:
         nav_focus: float,
         interactive_radius_clip: float,
     ):
+        """Load one exported DGGT scene, normalize it, and build the interactive viewer."""
         try:
             import viser
             import viser.transforms as vtf
@@ -128,6 +131,9 @@ class DGGT4DViewer:
         self.nav_focus = max(float(nav_focus), 0.25)
         self.interactive_radius_clip = max(float(interactive_radius_clip), 0.0)
 
+        # Scene metadata defines the saved temporal states and camera ordering.
+        # A positive --frames value only resamples the GUI timeline; it never
+        # creates new DGGT/TAPIP3D geometry.
         self.frame_times_s = torch.as_tensor(scene["frame_times_s"]).float()
         self.frame_times_norm = torch.as_tensor(scene["frame_times_norm"]).float()
         self.camera_order = list(scene["camera_order"])
@@ -201,6 +207,20 @@ class DGGT4DViewer:
         self.K = self.intrinsics.numpy().reshape(self.T, self.V, 3, 3)
         self.images_grid = self.images_u8.reshape(
             self.T, self.V, *self.images_u8.shape[1:]
+        )
+
+        # Optional comparison images can be embedded directly in the scene file.
+        # This keeps the viewer self-contained: no NuScenes/DGGT paths are
+        # hardcoded here. Current older exports only contain images_u8, so these
+        # grids will be None until the exporter saves the optional arrays.
+        self.rendered_images_grid = self._reshape_optional_image_grid(
+            scene.get("rendered_images_u8"), "rendered_images_u8"
+        )
+        gt_images = scene.get("ground_truth_images_u8")
+        if gt_images is None:
+            gt_images = scene.get("gt_images_u8")
+        self.ground_truth_images_grid = self._reshape_optional_image_grid(
+            gt_images, "ground_truth_images_u8"
         )
 
         # ------------------------------------------------------------
@@ -397,10 +417,12 @@ class DGGT4DViewer:
     # Time / camera helpers
     # ------------------------------------------------------------------
     def _time_for_frame(self, idx: int) -> float:
+        """Map a GUI frame index to the viewer's time in seconds."""
         idx = max(0, min(int(idx), self.frames - 1))
         return float(self.timeline_s[idx])
 
     def _norm_time(self, t_s: float) -> float:
+        """Convert viewer seconds to the normalized time used by DGGT lifespan weighting."""
         return float(
             np.interp(
                 t_s,
@@ -410,6 +432,7 @@ class DGGT4DViewer:
         )
 
     def _neighbors(self, t_s: float):
+        """Return the two saved temporal states bracketing a requested time and their blend factor."""
         times = self.frame_times_s.numpy()
         if t_s <= times[0]:
             return 0, 0, 0.0
@@ -424,11 +447,77 @@ class DGGT4DViewer:
         return i0, i1, float(a)
 
     def _camera_fov(self, ti: int, vi: int) -> float:
+        """Compute a source camera's vertical field of view from its saved intrinsics."""
         H = int(self.images_grid.shape[-2])
         fy = float(self.K[ti, vi, 1, 1])
         return float(2.0 * np.arctan2(H / 2.0, max(fy, 1.0e-8)))
 
+    def _reshape_optional_image_grid(self, images, name: str):
+        """Normalize an optional image tensor to [T, V, 3, H, W].
+
+        Exporters may store image comparisons either flattened as [T*V, 3, H, W]
+        or already grouped as [T, V, 3, H, W]. Returning None means that image
+        type is simply unavailable in this scene file.
+        """
+        if images is None:
+            return None
+        x = torch.as_tensor(images).cpu()
+        if x.ndim == 5 and x.shape[0] == self.T and x.shape[1] == self.V:
+            return x
+        if x.ndim == 4 and x.shape[0] == self.T * self.V:
+            return x.reshape(self.T, self.V, *x.shape[1:])
+        raise ValueError(
+            f"{name} must have shape [T,V,3,H,W] or [T*V,3,H,W]; "
+            f"got {tuple(x.shape)} for T={self.T}, V={self.V}"
+        )
+
+    def _image_mosaic(self, grid: torch.Tensor, ti: int) -> np.ndarray:
+        """Tile all camera images for one time step into one GUI preview image."""
+        ti = max(0, min(int(ti), self.T - 1))
+        imgs = grid[ti]
+        if imgs.dtype != torch.uint8:
+            imgs = imgs.float()
+            if float(imgs.max()) <= 1.0:
+                imgs = imgs * 255.0
+            imgs = imgs.round().clamp(0, 255).to(torch.uint8)
+
+        tiles = [
+            np.ascontiguousarray(img.permute(1, 2, 0).numpy())
+            for img in imgs
+        ]
+        h, w = tiles[0].shape[:2]
+        rows = 2 if self.V > 3 else 1
+        cols = int(math.ceil(self.V / rows))
+        pad = 4
+        canvas = np.zeros(
+            (rows * h + (rows - 1) * pad, cols * w + (cols - 1) * pad, 3),
+            dtype=np.uint8,
+        )
+        for vi, tile in enumerate(tiles):
+            r, c = divmod(vi, cols)
+            y0 = r * (h + pad)
+            x0 = c * (w + pad)
+            canvas[y0:y0 + h, x0:x0 + w] = tile
+        return canvas
+
+    def _update_image_panels(self, t_s: float):
+        """Refresh optional source/rendered/GT GUI mosaics at the nearest saved state."""
+        if not hasattr(self, "source_image_panel"):
+            return
+        ti = int(np.argmin(np.abs(self.frame_times_s.numpy() - t_s)))
+        if bool(self.show_source_images.value):
+            self.source_image_panel.image = self._image_mosaic(self.images_grid, ti)
+        if self.rendered_images_grid is not None and bool(self.show_rendered_images.value):
+            self.rendered_image_panel.image = self._image_mosaic(
+                self.rendered_images_grid, ti
+            )
+        if self.ground_truth_images_grid is not None and bool(self.show_ground_truth_images.value):
+            self.ground_truth_image_panel.image = self._image_mosaic(
+                self.ground_truth_images_grid, ti
+            )
+
     def _interpolated_car_center(self, t_s: float):
+        """Linearly interpolate the six-camera rig center along the saved trajectory."""
         i0, i1, a = self._neighbors(t_s)
         return (
             (1.0 - a) * self.car_centers[i0]
@@ -436,6 +525,7 @@ class DGGT4DViewer:
         )
 
     def _translate_clients_with_ego(self, old_t_s: float, new_t_s: float):
+        """Translate connected viewer cameras by ego motion while preserving user orientation."""
         if not bool(self.follow_ego.value):
             self._last_follow_t_s = new_t_s
             return
@@ -461,6 +551,7 @@ class DGGT4DViewer:
         self._last_follow_t_s = new_t_s
 
     def _snap_all_clients_to_car(self, t_s: float):
+        """Move all connected clients back to the current ego pose and forward heading."""
         i0, i1, a = self._neighbors(t_s)
         center = self._interpolated_car_center(t_s).astype(np.float64)
         forward = (
@@ -488,6 +579,7 @@ class DGGT4DViewer:
     # Rig visualization
     # ------------------------------------------------------------------
     def _build_rig(self):
+        """Create source-camera frustums, ego marker, heading arrow, and predicted rig path."""
         self.rig_frustums = []
         poses0 = self.c2w[0]
         _, H, W = self.images_grid.shape[2:]
@@ -536,6 +628,7 @@ class DGGT4DViewer:
         self._last_thumbnail = -1
 
     def _update_rig(self, t_s: float):
+        """Move the visualized camera rig to the current time and refresh its source thumbnails."""
         i0, i1, a = self._neighbors(t_s)
         centers = []
 
@@ -575,6 +668,7 @@ class DGGT4DViewer:
     # GUI
     # ------------------------------------------------------------------
     def _build_gui(self, fps: float, radius_clip: float):
+        """Build timeline, reconstruction controls, diagnostics, image comparisons, and performance controls."""
         s = self.server
 
         with s.gui.add_folder("DGGT 4D"):
@@ -706,6 +800,62 @@ class DGGT4DViewer:
                 initial_value=False,
             )
 
+        # Optional image comparisons are read from the same .pt scene file.
+        # Source/context thumbnails always exist. Rendered and ground-truth
+        # mosaics appear when the exporter stores the corresponding optional
+        # image arrays in the scene.
+        with s.gui.add_folder("Image comparison"):
+            self.show_source_images = s.gui.add_checkbox(
+                "Show source images", initial_value=False
+            )
+            self.source_image_panel = s.gui.add_image(
+                self._image_mosaic(self.images_grid, 0),
+                label="Source / context images",
+                visible=False,
+            )
+
+            rendered_available = self.rendered_images_grid is not None
+            self.show_rendered_images = s.gui.add_checkbox(
+                "Show rendered images",
+                initial_value=False,
+                disabled=not rendered_available,
+            )
+            self.rendered_image_panel = s.gui.add_image(
+                self._image_mosaic(
+                    self.rendered_images_grid if rendered_available else self.images_grid,
+                    0,
+                ),
+                label="Rendered images",
+                visible=False,
+            )
+
+            gt_available = self.ground_truth_images_grid is not None
+            self.show_ground_truth_images = s.gui.add_checkbox(
+                "Show ground truth images",
+                initial_value=False,
+                disabled=not gt_available,
+            )
+            self.ground_truth_image_panel = s.gui.add_image(
+                self._image_mosaic(
+                    self.ground_truth_images_grid if gt_available else self.images_grid,
+                    0,
+                ),
+                label="Ground truth images",
+                visible=False,
+            )
+
+            unavailable = []
+            if not rendered_available:
+                unavailable.append("rendered_images_u8")
+            if not gt_available:
+                unavailable.append("ground_truth_images_u8")
+            if unavailable:
+                self.image_note = s.gui.add_markdown(
+                    "Optional image comparisons unavailable in this scene: `"
+                    + "`, `".join(unavailable)
+                    + "`. Re-export the scene with those arrays to enable them."
+                )
+
         with s.gui.add_folder("Performance"):
             self.fast_interaction = s.gui.add_checkbox(
                 "Fast interaction",
@@ -754,6 +904,7 @@ class DGGT4DViewer:
             new_t = self._time_for_frame(int(self.frame.value))
             old_t = getattr(self, "_last_follow_t_s", new_t)
             self._translate_clients_with_ego(old_t, new_t)
+            self._update_image_panels(new_t)
             self._invalidate_scene_cache()
             self.status.content = self._status()
             if hasattr(self, "viewer"):
@@ -788,6 +939,7 @@ class DGGT4DViewer:
 
         @self.show_camera_rig.on_update
         def _toggle(_event):
+            # Camera-rig visibility is independent of the 2D comparison panels.
             v = bool(self.show_camera_rig.value)
             for h in self.rig_frustums:
                 h.visible = v
@@ -796,21 +948,59 @@ class DGGT4DViewer:
             if self.rig_path is not None:
                 self.rig_path.visible = v
 
-        # Default V6 behavior: hide the rig to reduce websocket/UI work.
+        @self.show_source_images.on_update
+        def _toggle_source_images(_event):
+            self.source_image_panel.visible = bool(self.show_source_images.value)
+            self._update_image_panels(
+                self._time_for_frame(int(self.frame.value))
+            )
+
+        @self.show_rendered_images.on_update
+        def _toggle_rendered_images(_event):
+            self.rendered_image_panel.visible = (
+                self.rendered_images_grid is not None
+                and bool(self.show_rendered_images.value)
+            )
+            self._update_image_panels(
+                self._time_for_frame(int(self.frame.value))
+            )
+
+        @self.show_ground_truth_images.on_update
+        def _toggle_ground_truth_images(_event):
+            self.ground_truth_image_panel.visible = (
+                self.ground_truth_images_grid is not None
+                and bool(self.show_ground_truth_images.value)
+            )
+            self._update_image_panels(
+                self._time_for_frame(int(self.frame.value))
+            )
+
+        # Default behavior: hide camera/image diagnostics until explicitly enabled.
         for h in self.rig_frustums:
             h.visible = bool(self.show_camera_rig.value)
         self.rig_center.visible = bool(self.show_camera_rig.value)
         self.heading.visible = bool(self.show_camera_rig.value)
         if self.rig_path is not None:
             self.rig_path.visible = bool(self.show_camera_rig.value)
+        self.source_image_panel.visible = bool(self.show_source_images.value)
+        self.rendered_image_panel.visible = (
+            self.rendered_images_grid is not None
+            and bool(self.show_rendered_images.value)
+        )
+        self.ground_truth_image_panel.visible = (
+            self.ground_truth_images_grid is not None
+            and bool(self.show_ground_truth_images.value)
+        )
 
     def _invalidate_scene_cache(self):
+        """Discard the assembled Gaussian-bank cache after any setting that changes scene contents."""
         self._scene_cache_key = None
         self._scene_cache_bank = None
         self._cached_red_colors_key = None
         self._cached_red_colors = None
 
     def _status(self):
+        """Generate the compact live status text shown below the controls."""
         t = self._time_for_frame(int(self.frame.value))
         i0, i1, a = self._neighbors(t)
         cam = getattr(self, "_last_selected_dynamic_cam", 0)
@@ -845,6 +1035,7 @@ class DGGT4DViewer:
     # physically interpolated mode-3 state produced by official interp_all().
     # ------------------------------------------------------------------
     def _static_bank(self, t_norm: float):
+        """Filter static Gaussians and apply DGGT's confidence-based temporal lifespan opacity."""
         if not bool(self.show_static.value):
             return None
 
@@ -876,6 +1067,7 @@ class DGGT4DViewer:
         }
 
     def _select_dynamic_camera(self, ti: int, viewer_c2w: torch.Tensor) -> int:
+        """Choose which camera-specific dynamic bank to use for the current viewer direction."""
         policy = str(self.dynamic_policy.value)
 
         if policy == "manual":
@@ -903,6 +1095,7 @@ class DGGT4DViewer:
         return vi
 
     def _dynamic_single(self, ti: int, vi: int, weight: float):
+        """Filter and return one dynamic Gaussian bank for a saved time/camera pair."""
         if not bool(self.show_dynamic.value) or weight <= 0.0:
             return None
 
@@ -937,6 +1130,7 @@ class DGGT4DViewer:
         viewer_c2w: torch.Tensor,
         weight: float,
     ):
+        """Return the selected dynamic bank(s), including all-six debug mode when requested."""
         vi = self._select_dynamic_camera(ti, viewer_c2w)
 
         if vi >= 0:
@@ -952,6 +1146,7 @@ class DGGT4DViewer:
         return out
 
     def _scene_at(self, t_s: float, viewer_c2w: torch.Tensor):
+        """Assemble and cache the active static + dynamic Gaussian tensors for one viewer time."""
         # Build a compact signature first. Viewer camera motion only invalidates
         # the bank when nearest-view crosses into a different DGGT camera.
         i0, i1, a = self._neighbors(t_s)
@@ -1027,6 +1222,7 @@ class DGGT4DViewer:
     # ------------------------------------------------------------------
     @torch.inference_mode()
     def _render_fn(self, camera_state, render_arg):
+        """Rasterize the currently assembled Gaussian scene from the interactive camera pose."""
         width, height = resolve_render_size(render_arg)
 
         c2w = torch.as_tensor(
@@ -1112,6 +1308,7 @@ class DGGT4DViewer:
         return rgb.cpu().numpy()
 
     def run(self):
+        """Run the viewer playback loop until the process is interrupted."""
         print("[viewer] Open the Viser URL printed above.")
         print("[viewer] Navigation is standard +Z-up viser/nerfview, like STORM.")
         print("[viewer] V6 scene-bank cache enabled; camera motion reuses the current bank.")
@@ -1142,7 +1339,10 @@ class DGGT4DViewer:
 
 
 def main():
+    """Parse viewer CLI arguments, load the scene file, and launch the server."""
     p = argparse.ArgumentParser()
+    # The viewer has no hardcoded dataset/checkpoint paths. The only runtime
+    # scene path is supplied here; all cameras/images/Gaussians come from it.
     p.add_argument("--scene", required=True)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--port", type=int, default=8080)
